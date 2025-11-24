@@ -22,7 +22,6 @@ $configure.addEventListener('click', async () => {
   try {
     provider = await openaiConfig({
       defaultBaseUrls: [
-        'https://api.openai.com/v1',
         'https://llmfoundry.straive.com/openai/v1',
         'https://llmfoundry.straivedemo.com/openai/v1',
       ],
