@@ -14,6 +14,8 @@ const $exampleList = document.getElementById('example-list');
 const $configure = document.getElementById('configure-provider');
 const $providerStatus = document.getElementById('provider-status');
 const $runOffline = document.getElementById('run-offline');
+const $file = document.getElementById('contract-file');
+const $llmStatus = document.getElementById('llm-status');
 
 // Persist form inputs
 saveform('#task-form', { exclude: '[type="file"]' });
@@ -30,7 +32,8 @@ examples.forEach((ex, i) => {
   $exampleList.appendChild(btn);
 });
 
-let provider = null; // { baseUrl, apiKey, models }
+// Shared provider across pages: read persisted value first
+let provider = JSON.parse(localStorage.getItem('bootstrap-llm-provider') || 'null');
 
 $configure.addEventListener('click', async () => {
   try {
@@ -39,11 +42,12 @@ $configure.addEventListener('click', async () => {
         'https://llmfoundry.straive.com/openai/v1',
         'https://llmfoundry.straivedemo.com/openai/v1',
       ],
-      help: '<div class="alert alert-info">Your key stays in browser storage. No server.</div>',
+      help: '<div class="alert alert-info">Your key is stored locally and reused across demos (AUM & Recon).</div>',
       show: true,
     });
+    localStorage.setItem('bootstrap-llm-provider', JSON.stringify(provider));
     $providerStatus.textContent = `Using ${provider.baseUrl}. Models: ${provider.models.slice(0,4).join(', ')}`;
-    bootstrapAlert({ title: 'Provider Saved', body: 'Configuration stored locally.', color: 'success' });
+    bootstrapAlert({ title: 'Provider Saved', body: 'Configuration stored locally for reuse.', color: 'success' });
   } catch (err) {
     bootstrapAlert({ title: 'Provider Error', body: err.message, color: 'danger' });
   }
@@ -51,50 +55,121 @@ $configure.addEventListener('click', async () => {
 
 // Global fetch wrapper with status indicator
 globalThis.customFetch = function(url, options) {
-  $status.classList.remove('d-none');
-  $status.textContent = `Fetching ${url}...`;
+  $llmStatus.textContent = `Fetching ${url}...`;
   return fetch(url, options);
 };
+
+// Configure pdf.js worker if available
+if (window.pdfjsLib) {
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+}
+
+// Read uploaded contract file (.txt, .pdf, .docx) and populate textarea
+async function extractPdfText(arrayBuffer) {
+  const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  let text = '';
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    text += content.items.map(item => item.str).join(' ') + '\n\n';
+  }
+  return text.trim();
+}
+
+async function readContractFile(file) {
+  const name = (file.name || '').toLowerCase();
+  const ext = name.split('.').pop();
+  if (ext === 'txt' || file.type === 'text/plain') {
+    return await file.text();
+  }
+  if (ext === 'docx') {
+    const buf = await file.arrayBuffer();
+    if (!window.mammoth) throw new Error('DOCX reader not loaded');
+    const res = await window.mammoth.extractRawText({ arrayBuffer: buf });
+    return (res.value || '').trim();
+  }
+  if (ext === 'pdf') {
+    const buf = await file.arrayBuffer();
+    if (!window.pdfjsLib) throw new Error('PDF reader not loaded');
+    return await extractPdfText(buf);
+  }
+  throw new Error('Unsupported file type. Please upload .txt, .pdf, or .docx');
+}
+
+$file?.addEventListener('change', async (e) => {
+  try {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    $status.classList.remove('d-none');
+    $status.textContent = `Reading ${f.name}...`;
+    const text = await readContractFile(f);
+    document.getElementById('contract').value = text;
+    $status.classList.add('d-none');
+    bootstrapAlert({ title: 'File Loaded', body: `Parsed ${f.name}.`, color: 'success' });
+  } catch (err) {
+    $status.classList.add('d-none');
+    bootstrapAlert({ title: 'File Error', body: err.message, color: 'warning' });
+  }
+});
 
 $form.addEventListener('submit', async (e) => {
   e.preventDefault();
   try {
     const text = document.getElementById('contract').value.trim();
     const category = document.getElementById('category').value;
-    const output = document.getElementById('output').value;
 
     if (!text) {
-      bootstrapAlert({ title: 'Input Required', body: 'Please paste contract text or choose an example.', color: 'warning' });
+      bootstrapAlert({ title: 'Input Required', body: 'Please paste contract text or upload a document.', color: 'warning' });
       return;
     }
 
-    // Progress: show streaming
+    // Show streaming status using asyncllm events (no JSON output)
     $status.classList.remove('d-none');
-    $status.textContent = 'Analyzing with LLM...';
+    $status.textContent = 'Starting LLM stream...';
 
-    const baseUrl = provider?.baseUrl || 'https://llmfoundry.straive.com/openai/v1';
-    const apiKey = provider?.apiKey || '';
-    const model = models[0];
+    const saved = JSON.parse(localStorage.getItem('bootstrap-llm-provider')||'{}');
+    const baseUrl = (saved.baseUrl) || (provider?.baseUrl) || 'https://llmfoundry.straive.com/openai/v1';
+    const apiKey = (saved.apiKey) || (provider?.apiKey) || '';
+    const model = (saved.models && saved.models[0]) || (provider?.models && provider.models[0]) || 'gpt-5-mini';
 
     const request = { method: 'POST', headers: { 'Content-Type': 'application/json' } };
     if (apiKey) request.headers['Authorization'] = `Bearer ${apiKey}`;
 
     let content = '';
+    let chunks = 0;
+    const t0 = Date.now();
+    const sys = systemPrompt.replace('```json','').replace('```',''); // remove JSON instruction
+
     for await (const event of asyncLLM(`${baseUrl}/chat/completions`, {
       ...request,
       body: JSON.stringify({
         model,
         stream: true,
         messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: `Category: ${category}\nOutput: ${output}\n\nContract:\n${text}` },
+          { role: 'system', content: sys + '\nDo not output raw JSON. Present markdown tables and narrative only.' },
+          { role: 'user', content: `Category: ${category}\n\nContract:\n${text}` },
         ],
       }),
       fetch: globalThis.customFetch,
     })) {
-      if (event.error) throw new Error(event.error);
+      if (event.error) {
+        $llmStatus.textContent = `Stream error: ${event.error}`;
+        throw new Error(event.error);
+      }
       content = event.content ?? content;
       $results.innerHTML = marked.parse(content);
+      if (event.type === 'open') {
+        $llmStatus.textContent = `Streaming started (model: ${model})...`;
+      } else if (event.delta) {
+        chunks += 1;
+        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+        $llmStatus.textContent = `Streaming... chunks: ${chunks}, elapsed: ${elapsed}s`;
+      } else if (event.type === 'response') {
+        $llmStatus.textContent = 'Finalizing response...';
+      } else if (event.type === 'close') {
+        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+        $llmStatus.textContent = `Completed (${chunks} chunks, ${elapsed}s)`;
+      }
     }
 
     $status.classList.add('d-none');
@@ -117,21 +192,22 @@ $runOffline.addEventListener('click', () => {
     const users = usersMatch ? parseInt(usersMatch[1],10) : 0;
     const aumB = aumMatch ? parseFloat(aumMatch[1]) : 2.5;
 
-    const allocation = [
-      { unit: 'Core FI', basis: category==='vendor' ? 'users' : 'aum', amount: category==='vendor' ? Math.round(fee*0.4) : Math.round(aumB*1e9*0.0035) },
-      { unit: 'Credit', basis: category==='vendor' ? 'users' : 'aum', amount: category==='vendor' ? Math.round(fee*0.3) : Math.round(aumB*1e9*0.0015) },
-      { unit: 'Quant', basis: category==='vendor' ? 'users' : 'aum', amount: category==='vendor' ? Math.round(fee*0.3) : Math.round(aumB*1e9*0.0005) },
+    const rows = [
+      ['Unit','Basis','Amount'],
+      ['Core FI', category==='vendor' ? 'users' : 'aum', (category==='vendor' ? Math.round(fee*0.4) : Math.round(aumB*1e9*0.0035)).toLocaleString()],
+      ['Credit', category==='vendor' ? 'users' : 'aum', (category==='vendor' ? Math.round(fee*0.3) : Math.round(aumB*1e9*0.0015)).toLocaleString()],
+      ['Quant', category==='vendor' ? 'users' : 'aum', (category==='vendor' ? Math.round(fee*0.3) : Math.round(aumB*1e9*0.0005)).toLocaleString()],
     ];
-    const totals = {
-      feeAnnualUSD: fee,
-      users,
-      aumUSD: Math.round(aumB*1e9),
-    };
-
-    const md = ['# Allocation (Heuristic)', '', '```json', JSON.stringify({ allocation, totals, assumptions: ['heuristic split 40/30/30'] }, null, 2), '```'].join('\n');
-    $results.innerHTML = md.replace(/\n/g,'<br>');
+    const table = ['| ' + rows[0].join(' | ') + ' |', '|---|---|---|', rows.slice(1).map(r=>`| ${r.join(' | ')} |`).join('\n')].join('\n');
+    const bullets = [
+      `- Fee (annual): $${fee.toLocaleString()}`,
+      `- Users: ${users}`,
+      `- AUM: $${Math.round(aumB*1e9).toLocaleString()}`,
+      `- Assumptions: heuristic split 40/30/30`,
+    ].join('\n');
+    const md = ['# Allocation (Heuristic)', '', table, '', '## Notes', bullets].join('\n');
+    $results.innerHTML = marked.parse(md);
   } catch (err) {
     bootstrapAlert({ title: 'Error', body: err.message, color: 'danger' });
   }
 });
-

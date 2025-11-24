@@ -7,17 +7,30 @@ import { Marked } from "marked";
 import { systemPrompt, examples, models } from "./config.js";
 
 const marked = new Marked();
-const $form = document.querySelector('#task-form');
 const $results = document.getElementById('results');
-const $status = document.getElementById('status');
+const $llmStatus = document.getElementById('llm-status');
 const $configure = document.getElementById('configure-provider');
+const $exampleList = document.getElementById('example-list');
+const $aborFile = document.getElementById('abor-file');
+const $iborFile = document.getElementById('ibor-file');
 
 saveform('#task-form', { exclude: '[type="file"]' });
 
-document.getElementById('abor').value = examples.abor;
-document.getElementById('ibor').value = examples.ibor;
+// Populate examples
+examples.forEach(ex => {
+  const btn = document.createElement('button');
+  btn.className = 'list-group-item list-group-item-action';
+  btn.textContent = ex.title;
+  btn.addEventListener('click', () => {
+    document.getElementById('abor').value = ex.abor;
+    document.getElementById('ibor').value = ex.ibor;
+  });
+  $exampleList.appendChild(btn);
+});
 
-let provider = null;
+// Shared provider across modules
+let provider = JSON.parse(localStorage.getItem('bootstrap-llm-provider') || 'null');
+
 $configure.addEventListener('click', async () => {
   try {
     provider = await openaiConfig({
@@ -25,129 +38,107 @@ $configure.addEventListener('click', async () => {
         'https://llmfoundry.straive.com/openai/v1',
         'https://llmfoundry.straivedemo.com/openai/v1',
       ],
+      help: '<div class="alert alert-info">Stored in browser; shared across demos (AUM & Recon).</div>',
       show: true,
     });
-    bootstrapAlert({ title: 'Provider Saved', body: `Using ${provider.baseUrl}`, color: 'success' });
+    localStorage.setItem('bootstrap-llm-provider', JSON.stringify(provider));
+    bootstrapAlert({ title: 'Provider Saved', body: 'Provider available across AUM and Recon.', color: 'success' });
   } catch (err) {
     bootstrapAlert({ title: 'Provider Error', body: err.message, color: 'danger' });
   }
 });
 
-// Progress wrapper
-globalThis.customFetch = function(url, options) {
-  $status.classList.remove('d-none');
-  $status.textContent = `Fetching ${url}...`;
-  return fetch(url, options);
-};
-
-function parseCSV(text) {
-  const lines = text.split(/\r?\n/).filter(Boolean);
-  const header = lines.shift().split(',').map(s=>s.trim().toLowerCase());
-  const idx = {
-    instrument: header.indexOf('instrument'),
-    qty: header.indexOf('qty'),
-    price: header.indexOf('price'),
-  };
-  const rows = [];
-  for (const line of lines) {
-    const cols = line.split(',').map(s=>s.trim());
-    if (cols.length < 2) continue;
-    const instrument = cols[idx.instrument] || cols[0];
-    const qty = parseFloat(cols[idx.qty] || '0');
-    const price = parseFloat(cols[idx.price] || '0');
-    rows.push({ instrument, qty, price });
+// PDF text extraction
+if (window.pdfjsLib) {
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+}
+async function extractPdfText(file) {
+  const buf = await file.arrayBuffer();
+  const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
+  let text = '';
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    text += content.items.map(item => item.str).join(' ') + '\n';
   }
-  return rows;
+  return text.trim();
 }
 
-function reconcileLocal(aborText, iborText, thresholdFrac) {
-  const abor = parseCSV(aborText);
-  const ibor = parseCSV(iborText);
-  const mapA = new Map(abor.map(r=>[r.instrument, r]));
-  const mapI = new Map(ibor.map(r=>[r.instrument, r]));
-  const instruments = Array.from(new Set([...mapA.keys(), ...mapI.keys()])).sort();
+// File inputs (CSV or PDF)
+$aborFile?.addEventListener('change', async (e) => {
+  try {
+    const f = e.target.files?.[0]; if (!f) return;
+    const text = f.name.toLowerCase().endsWith('.pdf') ? await extractPdfText(f) : await f.text();
+    document.getElementById('abor').value = text;
+    bootstrapAlert({ title: 'ABOR Loaded', body: `Parsed ${f.name}.`, color: 'success' });
+  } catch (err) { bootstrapAlert({ title: 'File Error', body: err.message, color: 'warning' }); }
+});
+$iborFile?.addEventListener('change', async (e) => {
+  try {
+    const f = e.target.files?.[0]; if (!f) return;
+    const text = f.name.toLowerCase().endsWith('.pdf') ? await extractPdfText(f) : await f.text();
+    document.getElementById('ibor').value = text;
+    bootstrapAlert({ title: 'IBOR Loaded', body: `Parsed ${f.name}.`, color: 'success' });
+  } catch (err) { bootstrapAlert({ title: 'File Error', body: err.message, color: 'warning' }); }
+});
 
-  const totalAUM = abor.reduce((sum, r)=> sum + (r.qty * (r.price||0)), 0);
-  const threshold = totalAUM * thresholdFrac; // fraction of AUM
-
-  const rows = [];
-  const exceptions = [];
-  for (const inst of instruments) {
-    const a = mapA.get(inst) || { qty: 0, price: 0 };
-    const i = mapI.get(inst) || { qty: 0, price: 0 };
-    const notionalA = a.qty * (a.price || i.price || 0);
-    const notionalI = i.qty * (i.price || a.price || 0);
-    const diffQty = (a.qty || 0) - (i.qty || 0);
-    const diffNotional = notionalA - notionalI;
-    const row = { instrument: inst, aborQty: a.qty||0, iborQty: i.qty||0, diffQty, aborNotional: +notionalA.toFixed(2), iborNotional: +notionalI.toFixed(2), diffNotional: +diffNotional.toFixed(2) };
-    rows.push(row);
-    if (Math.abs(diffNotional) >= threshold) exceptions.push(row);
-  }
-  const totals = {
-    aumApprox: +totalAUM.toFixed(2),
-    totalDiffNotional: +rows.reduce((s,r)=> s + r.diffNotional, 0).toFixed(2),
-    exceptionsCount: exceptions.length,
-    threshold: +threshold.toFixed(2),
-  };
-  return { rows, exceptions, totals, notes: [] };
-}
-
-$form.addEventListener('submit', async (e) => {
+// Submit: LLM builds the table and narrative
+document.getElementById('task-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   try {
     const abor = document.getElementById('abor').value.trim();
     const ibor = document.getElementById('ibor').value.trim();
     const threshold = parseFloat(document.getElementById('threshold').value || '0.01');
-    const output = document.getElementById('output').value;
 
     if (!abor || !ibor) {
-      bootstrapAlert({ title: 'Input Required', body: 'Paste ABOR and IBOR CSVs (examples are prefilled).', color: 'warning' });
+      bootstrapAlert({ title: 'Input Required', body: 'Provide ABOR and IBOR (CSV or PDF).', color: 'warning' });
+      return;
+    }
+    if (!provider?.baseUrl) {
+      bootstrapAlert({ title: 'LLM Required', body: 'Click Configure LLM to set provider.', color: 'warning' });
       return;
     }
 
-    // Local reconciliation first
-    $status.classList.remove('d-none');
-    $status.textContent = 'Reconciling locally...';
-    const result = reconcileLocal(abor, ibor, threshold);
-    const md = () => {
-      const header = '| Instrument | ABOR Qty | IBOR Qty | Diff Qty | ABOR Notional | IBOR Notional | Diff Notional |\n|---|---:|---:|---:|---:|---:|---:|';
-      const body = result.rows.map(r => `| ${r.instrument} | ${r.aborQty} | ${r.iborQty} | ${r.diffQty} | ${r.aborNotional} | ${r.iborNotional} | ${r.diffNotional} |`).join('\n');
-      const jsonBlock = '```json\n' + JSON.stringify({ exceptions: result.exceptions, totals: result.totals, notes: result.notes }, null, 2) + '\n```';
-      return ['# ABOR <-> IBOR Reconciliation', '', header, body, '', jsonBlock].join('\n');
-    };
-    $results.innerHTML = marked.parse(output === 'json' ? '```json\n' + JSON.stringify(result, null, 2) + '\n```' : md());
+    $llmStatus.textContent = 'Starting LLM stream...';
+    const baseUrl = provider.baseUrl;
+    const apiKey = provider.apiKey || '';
+    const model = (provider.models && provider.models[0]) || models[0];
+    const request = { method: 'POST', headers: { 'Content-Type': 'application/json' } };
+    if (apiKey) request.headers['Authorization'] = `Bearer ${apiKey}`;
 
-    // If provider configured, get LLM summary/validation
-    if (provider) {
-      $status.textContent = 'Reconciling via LLM...';
-      const baseUrl = provider.baseUrl;
-      const apiKey = provider.apiKey || '';
-      const model = models[0];
-      const request = { method: 'POST', headers: { 'Content-Type': 'application/json' } };
-      if (apiKey) request.headers['Authorization'] = `Bearer ${apiKey}`;
+    let content = '';
+    let chunks = 0;
+    const t0 = Date.now();
+    const llmSystem = 'Compute ABOR vs IBOR reconciliation and render a clear Markdown table and short summary for business users. No raw JSON.';
+    const userMsg = [
+      `Exception Threshold (fraction of AUM): ${threshold}`,
+      'Required table columns:',
+      'Instrument | ABOR Qty | IBOR Qty | Diff Qty | ABOR Notional | IBOR Notional | Diff Notional',
+      'Use price * qty for notional; compute AUM from ABOR; consider threshold to identify material exceptions; include a brief summary above the table.',
+      '',
+      'ABOR Data:', abor,
+      '',
+      'IBOR Data:', ibor,
+    ].join('\n');
 
-      let content = '';
-      for await (const event of asyncLLM(`${baseUrl}/chat/completions`, {
-        ...request,
-        body: JSON.stringify({
-          model,
-          stream: true,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: `Threshold: ${threshold}\nOutput: ${output}\n\nABOR:\n${abor}\n\nIBOR:\n${ibor}\n\nLocal result:\n${JSON.stringify(result)}` },
-          ],
-        }),
-        fetch: globalThis.customFetch,
-      })) {
-        if (event.error) throw new Error(event.error);
-        content = event.content ?? content;
-        $results.innerHTML = marked.parse(content);
-      }
+    for await (const event of asyncLLM(`${baseUrl}/chat/completions`, {
+      ...request,
+      body: JSON.stringify({ model, stream: true, messages: [
+        { role: 'system', content: llmSystem },
+        { role: 'user', content: userMsg },
+      ]}),
+      fetch: (url, options) => { $llmStatus.textContent = `Fetching ${url}...`; return fetch(url, options); },
+    })) {
+      if (event.error) { $llmStatus.textContent = `Stream error: ${event.error}`; throw new Error(event.error); }
+      content = event.content ?? content;
+      $results.innerHTML = marked.parse(content);
+      if (event.type === 'open') { $llmStatus.textContent = `Streaming started (model: ${model})...`; }
+      else if (event.delta) { chunks += 1; const elapsed = ((Date.now() - t0)/1000).toFixed(1); $llmStatus.textContent = `Streaming... chunks: ${chunks}, elapsed: ${elapsed}s`; }
+      else if (event.type === 'response') { $llmStatus.textContent = 'Finalizing response...'; }
+      else if (event.type === 'close') { const elapsed = ((Date.now() - t0)/1000).toFixed(1); $llmStatus.textContent = `Completed (${chunks} chunks, ${elapsed}s)`; }
     }
-
-    $status.classList.add('d-none');
   } catch (err) {
-    $status.classList.add('d-none');
+    $llmStatus.textContent = '';
     bootstrapAlert({ title: 'Error', body: err.message, color: 'danger' });
   }
 });
